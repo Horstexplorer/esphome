@@ -21,6 +21,10 @@
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
 
+#ifdef USE_ESP32_CAMERA_JPEG_ENCODER
+#include <img_converters.h>
+#endif
+
 namespace esphome::mipi_csi {
 
 static const char *const TAG = "mipi_csi";
@@ -32,27 +36,28 @@ static constexpr BaseType_t CAPTURE_TASK_CORE = 1;
 static constexpr uint32_t THROUGHPUT_REPORT_INTERVAL_MS = 5000;
 /// How long the capture task waits before retrying after a dequeue error.
 static constexpr uint32_t CAPTURE_RETRY_DELAY_MS = 100;
+/// How often one frame is offered to the encoder again after it has grown its output buffer.
+static constexpr uint8_t MAX_ENCODE_ATTEMPTS = 8;
+/// Smallest output buffer the encoder is given, so that tiny frames still have room for the headers.
+static constexpr size_t MIN_OUTPUT_SIZE = 8192;
 
-/// How a configured pixel format maps onto the video device and the JPEG encoder.
+/// How a configured pixel format maps onto the video device.
 struct FormatMapping {
   uint32_t fourcc;
-  jpeg_enc_input_format_t jpeg_input;
-  jpeg_down_sampling_type_t sub_sample;
-  uint8_t bytes_per_pixel;
   const char *name;
 };
 
-static FormatMapping get_format_mapping(PixelFormat format) {
+static FormatMapping get_format_mapping(camera::PixelFormat format) {
   switch (format) {
-    case PixelFormat::PIXEL_FORMAT_RGB888:
-      return {V4L2_PIX_FMT_RGB24, JPEG_ENCODE_IN_FORMAT_RGB888, JPEG_DOWN_SAMPLING_YUV444, 3, "RGB888"};
-    case PixelFormat::PIXEL_FORMAT_YUV422:
-      return {V4L2_PIX_FMT_UYVY, JPEG_ENCODE_IN_FORMAT_YUV422, JPEG_DOWN_SAMPLING_YUV422, 2, "YUV422"};
-    case PixelFormat::PIXEL_FORMAT_GRAYSCALE:
-      return {V4L2_PIX_FMT_GREY, JPEG_ENCODE_IN_FORMAT_GRAY, JPEG_DOWN_SAMPLING_GRAY, 1, "GRAYSCALE"};
-    case PixelFormat::PIXEL_FORMAT_RGB565:
+    // The ISP writes its three byte pixels as B, G, R, which is the layout the encoder knows as
+    // BGR888. V4L2 still calls that format RGB24.
+    case camera::PIXEL_FORMAT_BGR888:
+      return {V4L2_PIX_FMT_RGB24, "RGB888"};
+    case camera::PIXEL_FORMAT_GRAYSCALE:
+      return {V4L2_PIX_FMT_GREY, "GRAYSCALE"};
+    case camera::PIXEL_FORMAT_RGB565:
     default:
-      return {V4L2_PIX_FMT_RGB565, JPEG_ENCODE_IN_FORMAT_RGB565, JPEG_DOWN_SAMPLING_YUV422, 2, "RGB565"};
+      return {V4L2_PIX_FMT_RGB565, "RGB565"};
   }
 }
 
@@ -292,14 +297,36 @@ bool MipiCsiCamera::configure_device_() {
   this->apply_control_(V4L2_CID_HFLIP, this->horizontal_flip_, "horizontal flip");
   this->apply_control_(V4L2_CID_VFLIP, this->vertical_flip_, "vertical flip");
 
-  if (!this->read_back_format_(mapping.fourcc, mapping.bytes_per_pixel, mapping.name))
+  if (!this->read_back_format_(mapping.fourcc, mapping.name))
     return false;
 
-  return this->encoder_.init(this->width_, this->height_, mapping.jpeg_input, mapping.sub_sample, this->jpeg_quality_,
-                             this->expected_frame_size_);
+  return this->prepare_encoder_();
 }
 
-bool MipiCsiCamera::read_back_format_(uint32_t expected_fourcc, uint8_t bytes_per_pixel, const char *name) {
+bool MipiCsiCamera::prepare_encoder_() {
+#ifdef USE_ESP32_CAMERA_JPEG_ENCODER
+  // The encoder reads the most significant byte of an RGB565 pixel first by default, while the
+  // video pipeline writes the least significant byte first. Without this, red and blue swap places.
+  jpgSetRgb565BE(false);
+#endif
+
+  // A JPEG is expected to be well under the raw frame size, and a quarter of it is enough headroom
+  // for everything but the highest quality settings. Growing the buffer costs a re-encode of the
+  // whole frame, so it is worth starting out large rather than letting it creep up frame by frame.
+  size_t wanted = std::max<size_t>(this->expected_frame_size_ / 4, MIN_OUTPUT_SIZE);
+  camera::EncoderBuffer *output = this->encoder_->get_output_buffer();
+  if (output->get_max_size() >= wanted)
+    return true;
+
+  if (!output->set_buffer_size(wanted)) {
+    ESP_LOGE(TAG, "Failed to allocate a %zu byte encoder output buffer", wanted);
+    return false;
+  }
+  ESP_LOGD(TAG, "Encoder output buffer set to %zu bytes", output->get_max_size());
+  return true;
+}
+
+bool MipiCsiCamera::read_back_format_(uint32_t expected_fourcc, const char *name) {
   v4l2_format actual{};
   actual.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
   if (ioctl(this->fd_, VIDIOC_G_FMT, &actual) != 0) {
@@ -328,7 +355,10 @@ bool MipiCsiCamera::read_back_format_(uint32_t expected_fourcc, uint8_t bytes_pe
 
   this->width_ = actual.fmt.pix.width;
   this->height_ = actual.fmt.pix.height;
-  this->expected_frame_size_ = static_cast<size_t>(this->width_) * this->height_ * bytes_per_pixel;
+  this->spec_.width = this->width_;
+  this->spec_.height = this->height_;
+  this->spec_.format = this->pixel_format_;
+  this->expected_frame_size_ = this->spec_.bytes_per_image();
   return true;
 }
 
@@ -439,19 +469,48 @@ void MipiCsiCamera::dump_config() {
                 "  Sensor: %s\n"
                 "  Resolution: %ux%u\n"
                 "  Capture format: %s\n"
-                "  JPEG quality: %u\n"
                 "  Frame rate: %u fps\n"
                 "  Frame buffers: %u\n"
                 "  Flip: horizontal %s, vertical %s",
                 this->get_name().c_str(), this->sensor_name_, this->width_, this->height_,
-                get_format_mapping(this->pixel_format_).name, this->jpeg_quality_, this->framerate_,
-                this->frame_buffer_count_, YESNO(this->horizontal_flip_), YESNO(this->vertical_flip_));
+                get_format_mapping(this->pixel_format_).name, this->framerate_, this->frame_buffer_count_,
+                YESNO(this->horizontal_flip_), YESNO(this->vertical_flip_));
+  this->encoder_->dump_config();
   if (this->is_failed()) {
     ESP_LOGE(TAG, "Setup failed");
   }
 }
 
 /* ---------------- MipiCsiCamera: capture ---------------- */
+
+size_t MipiCsiCamera::encode_frame_(const FrameBuffer &frame) {
+  // The encoder is handed the whole mapped buffer, as Espressif's reference does: the length is
+  // what bounds the read of the region the camera wrote, so anything short of it leaves part of
+  // the picture behind.
+  MipiCsiFrame pixels(frame.data, frame.length);
+
+  for (uint8_t attempt = 0; attempt < MAX_ENCODE_ATTEMPTS; attempt++) {
+    camera::EncoderError error = this->encoder_->encode_pixels(&this->spec_, &pixels);
+    switch (error) {
+      case camera::ENCODER_ERROR_SUCCESS:
+        return this->encoder_->get_output_buffer()->get_size();
+      case camera::ENCODER_ERROR_RETRY_FRAME:
+        // The encoder grew its output buffer, so the same frame is worth another try.
+        continue;
+      case camera::ENCODER_ERROR_CONFIGURATION:
+        this->encoder_failed_.store(true);
+        App.wake_loop_threadsafe();
+        return 0;
+      case camera::ENCODER_ERROR_SKIP_FRAME:
+      default:
+        ESP_LOGW(TAG, "Encoding a frame failed: %s", camera::to_string(error));
+        return 0;
+    }
+  }
+
+  ESP_LOGW(TAG, "Gave up on a frame after %u encoding attempts", MAX_ENCODE_ATTEMPTS);
+  return 0;
+}
 
 void MipiCsiCamera::capture_task(void *param) {
   auto *self = static_cast<MipiCsiCamera *>(param);
@@ -469,15 +528,11 @@ void MipiCsiCamera::capture_task(void *param) {
     }
 
     if (self->frame_wanted_.load() && (buffer.flags & V4L2_BUF_FLAG_ERROR) == 0) {
-      // The encoder is handed the whole mapped buffer, as Espressif's reference does: the length is
-      // what bounds the cache invalidation before the JPEG engine's DMA reads it, so anything short
-      // of the region the camera wrote leaves stale data in the picture.
-      //
       // buffer.bytesused is not worth checking here. The CSI driver sets it to the configured frame
       // size rather than to the number of bytes it actually received, so it can never reveal a
       // short frame.
       const FrameBuffer &mapped = self->buffers_[buffer.index];
-      size_t length = self->encoder_.encode(mapped.data, mapped.length);
+      size_t length = self->encode_frame_(mapped);
       // Reported even when encoding failed: a length of zero tells the main loop that the request
       // it recorded was not served, so that a still image request is not silently dropped.
       xQueueSend(self->result_queue_, &length, portMAX_DELAY);
@@ -494,6 +549,12 @@ void MipiCsiCamera::capture_task(void *param) {
 
 void MipiCsiCamera::loop() {
   const uint32_t now = App.get_loop_component_start_time();
+
+  if (this->encoder_failed_.load()) {
+    ESP_LOGE(TAG, "The encoder rejected the capture format, so no more frames are encoded");
+    this->mark_failed();
+    return;
+  }
 
   // Release the previous image once every consumer has finished reading it, which frees the
   // encoder's output buffer for the next frame.
@@ -513,8 +574,8 @@ void MipiCsiCamera::loop() {
         this->last_update_ = now;
         return;
       }
-      this->current_image_ =
-          std::make_shared<MipiCsiImage>(this->encoder_.get_output_buffer(), length, this->pending_requesters_);
+      this->current_image_ = std::make_shared<MipiCsiImage>(this->encoder_->get_output_buffer()->get_data(), length,
+                                                            this->pending_requesters_);
       this->pending_requesters_ = 0;
       this->last_update_ = now;
       this->published_frames_++;

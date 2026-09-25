@@ -1,11 +1,14 @@
 psram:
   speed: 100MHz
 
+camera_encoder:
+  quality: 60
+
 mipi_csi:
   name: MIPI CSI Camera
   sensor: OV5647
   # resolution is optional; without it the sensor keeps its own default format.
-  pixel_format: YUV422
+  pixel_format: RGB888
   framerate: 15 fps
   sccb_frequency: 400kHz
   reset_pin: GPIO21

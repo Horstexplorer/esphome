@@ -1,12 +1,15 @@
 psram:
   speed: 100MHz
 
+camera_encoder:
+  quality: 50
+  buffer_size: 65536
+
 mipi_csi:
   name: MIPI CSI Camera
   sensor: SC2336
   resolution: 1280x720
   pixel_format: RGB565
-  jpeg_quality: 50
   framerate: 10 fps
   idle_framerate: 0.1 fps
   sccb_frequency: 100kHz

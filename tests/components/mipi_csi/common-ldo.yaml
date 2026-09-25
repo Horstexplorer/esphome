@@ -8,6 +8,8 @@ esp_ldo:
 psram:
   speed: 100MHz
 
+camera_encoder:
+
 mipi_csi:
   name: MIPI CSI Camera
   sensor: SC2336

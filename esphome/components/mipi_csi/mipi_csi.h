@@ -15,24 +15,12 @@
 #include <esp_cam_sensor_types.h>
 
 #include "esphome/components/camera/camera.h"
+#include "esphome/components/camera/encoder.h"
 #include "esphome/components/i2c/i2c_bus.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/helpers.h"
 
-#include "jpeg_encoder.h"
-
 namespace esphome::mipi_csi {
-
-/// Raw capture format requested from the video device.
-///
-/// Only formats the hardware JPEG encoder can consume are offered, because every captured frame is
-/// encoded to JPEG before it leaves this component.
-enum class PixelFormat : uint8_t {
-  PIXEL_FORMAT_RGB565,
-  PIXEL_FORMAT_RGB888,
-  PIXEL_FORMAT_YUV422,
-  PIXEL_FORMAT_GRAYSCALE,
-};
 
 /// Payload handed to the `on_image` automation.
 struct CameraImageData {
@@ -75,21 +63,34 @@ class MipiCsiImageReader : public camera::CameraImageReader {
   size_t offset_{0};
 };
 
+/// Non-owning view of a mapped capture buffer, handed to the encoder.
+class MipiCsiFrame final : public camera::Buffer {
+ public:
+  MipiCsiFrame(uint8_t *data, size_t length) : data_(data), length_(length) {}
+
+  uint8_t *get_data_buffer() override { return this->data_; }
+  size_t get_data_length() override { return this->length_; }
+
+ protected:
+  uint8_t *data_;
+  size_t length_;
+};
+
 /// Camera for MIPI-CSI sensors on the ESP32-P4.
 ///
-/// Frames are captured through the V4L2 interface of Espressif's `esp_video` component and encoded
-/// to JPEG by the chip's JPEG peripheral. Sensors with a RAW Bayer output are routed through the
-/// ISP, where `esp_ipa` runs auto exposure and auto white balance. `esp_video` wires that up on its
-/// own, so there is nothing to configure here beyond enabling it at build time.
+/// Frames are captured through the V4L2 interface of Espressif's `esp_video` component and handed
+/// to a `camera_encoder` for JPEG compression. Sensors with a RAW Bayer output are routed through
+/// the ISP, where `esp_ipa` runs auto exposure and auto white balance. `esp_video` wires that up on
+/// its own, so there is nothing to configure here beyond enabling it at build time.
 class MipiCsiCamera final : public camera::Camera {
  public:
   void set_sensor_name(const char *sensor_name) { this->sensor_name_ = sensor_name; }
+  void set_encoder(camera::Encoder *encoder) { this->encoder_ = encoder; }
   void set_resolution(uint16_t width, uint16_t height) {
     this->width_ = width;
     this->height_ = height;
   }
-  void set_pixel_format(PixelFormat format) { this->pixel_format_ = format; }
-  void set_jpeg_quality(uint8_t quality) { this->jpeg_quality_ = quality; }
+  void set_pixel_format(camera::PixelFormat format) { this->pixel_format_ = format; }
   void set_horizontal_flip(bool flip) { this->horizontal_flip_ = flip; }
   void set_vertical_flip(bool flip) { this->vertical_flip_ = flip; }
   void set_framerate(uint8_t framerate) { this->framerate_ = framerate; }
@@ -127,6 +128,10 @@ class MipiCsiCamera final : public camera::Camera {
   bool init_video_();
   bool select_sensor_format_();
   bool configure_device_();
+  bool prepare_encoder_();
+  /// Encodes one captured frame, growing the encoder's output buffer if it turns out to be short.
+  /// @return Length of the encoded image, or 0 when the frame could not be encoded.
+  size_t encode_frame_(const FrameBuffer &frame);
   bool start_streaming_();
   void teardown_();
   void report_throughput_(uint32_t now);
@@ -138,18 +143,18 @@ class MipiCsiCamera final : public camera::Camera {
   uint8_t resolve_framerate_(uint8_t sensor_fps) const;
   /// Applies a V4L2 user control, logging a warning if the sensor does not support it.
   void apply_control_(uint32_t id, int32_t value, const char *name);
-  /// Reads back the format the driver settled on, which the JPEG encoder has to match exactly.
-  bool read_back_format_(uint32_t expected_fourcc, uint8_t bytes_per_pixel, const char *name);
+  /// Reads back the format the driver settled on, which the encoder has to match exactly.
+  bool read_back_format_(uint32_t expected_fourcc, const char *name);
   bool has_requested_image_() const { return this->single_requesters_ != 0 || this->stream_requesters_ != 0; }
 
   static void capture_task(void *param);
 
   const char *sensor_name_{""};
+  camera::Encoder *encoder_{nullptr};
   /// Configured capture size, or zero to keep whatever resolution the sensor driver starts with.
   uint16_t width_{0};
   uint16_t height_{0};
-  PixelFormat pixel_format_{PixelFormat::PIXEL_FORMAT_RGB565};
-  uint8_t jpeg_quality_{40};
+  camera::PixelFormat pixel_format_{camera::PIXEL_FORMAT_RGB565};
   bool horizontal_flip_{false};
   bool vertical_flip_{false};
   uint8_t framerate_{10};
@@ -164,6 +169,8 @@ class MipiCsiCamera final : public camera::Camera {
   uint32_t xclk_frequency_{0};
 
   int fd_{-1};
+  /// Geometry and pixel layout the driver settled on, as passed to the encoder.
+  camera::CameraImageSpec spec_{};
   /// Frame size the driver reports and the encoder is set up for. A frame that arrives at a
   /// different size did not come out of the pipeline we configured.
   size_t expected_frame_size_{0};
@@ -173,11 +180,12 @@ class MipiCsiCamera final : public camera::Camera {
   size_t published_bytes_{0};
   uint32_t last_stats_{0};
   FixedVector<FrameBuffer> buffers_;
-  JpegEncoder encoder_;
   QueueHandle_t result_queue_{nullptr};
   TaskHandle_t capture_task_handle_{nullptr};
   /// Set by the main loop to ask the capture task for one frame, cleared by the task when done.
   std::atomic<bool> frame_wanted_{false};
+  /// Set by the capture task when the encoder reports a fault it cannot recover from.
+  std::atomic<bool> encoder_failed_{false};
 
   std::shared_ptr<MipiCsiImage> current_image_;
   std::vector<camera::CameraListener *> listeners_;

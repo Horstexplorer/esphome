@@ -3,6 +3,7 @@ import re
 from esphome import automation, pins
 import esphome.codegen as cg
 from esphome.components import esp32, i2c
+from esphome.components.camera_encoder import Encoder
 from esphome.components.esp32 import add_idf_component, add_idf_sdkconfig_option
 from esphome.components.esp32.const import VARIANT_ESP32P4
 import esphome.config_validation as cv
@@ -21,13 +22,13 @@ from esphome.core.entity_helpers import setup_entity
 from esphome.types import ConfigType
 
 from .const import (
+    CONF_ENCODER_ID,
     CONF_EXTERNAL_CLOCK,
     CONF_FRAME_BUFFER_COUNT,
     CONF_FRAMERATE,
     CONF_HORIZONTAL_FLIP,
     CONF_IDLE_FRAMERATE,
     CONF_INIT_LDO,
-    CONF_JPEG_QUALITY,
     CONF_ON_IMAGE,
     CONF_ON_STREAM_START,
     CONF_ON_STREAM_STOP,
@@ -40,10 +41,11 @@ from .sensors import SENSOR_FORMATS
 
 CODEOWNERS = ["@Horstexplorer"]
 
-DEPENDENCIES = ["esp32", "i2c", "psram"]
+DEPENDENCIES = ["camera_encoder", "esp32", "i2c", "psram"]
 AUTO_LOAD = ["camera"]
 MULTI_CONF = False
 
+camera_ns = cg.esphome_ns.namespace("camera")
 mipi_csi_ns = cg.esphome_ns.namespace("mipi_csi")
 MipiCsiCamera = mipi_csi_ns.class_("MipiCsiCamera", cg.Component, cg.EntityBase)
 CameraImageData = mipi_csi_ns.struct("CameraImageData")
@@ -57,11 +59,12 @@ MipiCsiStreamStopTrigger = mipi_csi_ns.class_(
     "MipiCsiStreamStopTrigger", automation.Trigger.template()
 )
 
-PixelFormat = mipi_csi_ns.enum("PixelFormat", is_class=True)
+PixelFormat = camera_ns.enum("PixelFormat")
+# The three byte format is called RGB888 by the video pipeline, but its bytes are stored in the
+# order B, G, R, which is what the encoder knows as BGR888.
 PIXEL_FORMATS = {
     "RGB565": PixelFormat.PIXEL_FORMAT_RGB565,
-    "RGB888": PixelFormat.PIXEL_FORMAT_RGB888,
-    "YUV422": PixelFormat.PIXEL_FORMAT_YUV422,
+    "RGB888": PixelFormat.PIXEL_FORMAT_BGR888,
     "GRAYSCALE": PixelFormat.PIXEL_FORMAT_GRAYSCALE,
 }
 
@@ -89,12 +92,12 @@ CONFIG_SCHEMA = cv.All(
     cv.ENTITY_BASE_SCHEMA.extend(
         {
             cv.GenerateID(): cv.declare_id(MipiCsiCamera),
+            cv.GenerateID(CONF_ENCODER_ID): cv.use_id(Encoder),
             cv.Required(CONF_SENSOR): cv.one_of(*SENSOR_FORMATS, upper=True),
             cv.Optional(CONF_RESOLUTION): validate_resolution,
             cv.Optional(CONF_PIXEL_FORMAT, default="RGB565"): cv.enum(
                 PIXEL_FORMATS, upper=True
             ),
-            cv.Optional(CONF_JPEG_QUALITY, default=40): cv.int_range(min=10, max=100),
             cv.Optional(CONF_FRAMERATE, default="10 fps"): cv.All(
                 cv.framerate, cv.Range(min=1, max=60)
             ),
@@ -144,7 +147,6 @@ CONFIG_SCHEMA = cv.All(
 
 SETTERS = {
     CONF_PIXEL_FORMAT: "set_pixel_format",
-    CONF_JPEG_QUALITY: "set_jpeg_quality",
     CONF_HORIZONTAL_FLIP: "set_horizontal_flip",
     CONF_VERTICAL_FLIP: "set_vertical_flip",
     CONF_FRAME_BUFFER_COUNT: "set_frame_buffer_count",
@@ -178,6 +180,9 @@ async def to_code(config: ConfigType) -> None:
 
     i2c_bus = await cg.get_variable(config[CONF_I2C_ID])
     cg.add(var.set_i2c_bus(i2c_bus))
+
+    encoder = await cg.get_variable(config[CONF_ENCODER_ID])
+    cg.add(var.set_encoder(encoder))
 
     if (external_clock := config.get(CONF_EXTERNAL_CLOCK)) is not None:
         cg.add(
